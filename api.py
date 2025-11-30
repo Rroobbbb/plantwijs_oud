@@ -448,34 +448,27 @@ def vocht_from_gwt(lat: float, lon: float) -> Tuple[Optional[str], dict, Optiona
     return klass, props, _gt_pretty(gt_raw)
 
 
-from typing import Optional, Tuple   # ← deze import moet ergens bovenin al staan
-
 def ahn_from_point(lat: float, lon: float) -> Tuple[Optional[float], dict]:
     """
     Haal AHN-hoogte (maaiveld t.o.v. NAP, in meters) op via PDOK AHN WMS.
     Retourneert (hoogte_m, raw_props).
     """
-    # Laagnaam uit _WMSMETA (bijv. 'dtm_05m'); fallback als iets misgaat
-    layer = _WMSMETA.get("ahn", {}).get("layer") or "dtm_05m"
-
-    # Gebruik exact dezelfde helper als /api/diag/featureinfo
-    props = _wms_getfeatureinfo(AHN_WMS, layer, lat, lon) or {}
+    layer = _WMSMETA.get("ahn", {}).get("layer") or "ahn_05m_dtm"
+    props = _wms_getfeatureinfo_rd(AHN_WMS, layer, lat, lon) or {}
 
     hoogte: Optional[float] = None
 
-    # 1) Probeer bekende keys met numerieke waarde (bij jou 'value_list')
-    for key in ("value_list", "value", "GRAY_INDEX", "GRAYINDEX", "Band1", "band_1"):
+    # 1) Probeer bekende keys met numerieke waarde
+    for key in ("GRAY_INDEX", "GRAYINDEX", "value", "Band1", "band_1"):
         if key in props and props[key] not in (None, ""):
             try:
-                # value_list kan bv. "0.1345" zijn
-                hoogte = float(str(props[key]).split(",")[0].strip())
+                hoogte = float(props[key])
                 break
             except (TypeError, ValueError):
                 continue
 
-    # 2) Fallback: uit tekst 1e getal plukken
+    # 2) Fallback: getal uit tekst vissen
     if hoogte is None and "_text" in props:
-        import re
         m = re.search(r"(-?\d+(?:\.\d+)?)", str(props["_text"]))
         if m:
             try:
@@ -828,41 +821,11 @@ def index() -> str:
     });
     const infoCtl = new InfoCtl({ position:'topright' }).addTo(map);
 
-    function setClickInfo({fgr,bodem,bodem_bron,gt,vocht,vocht_basis,vocht_ahn_correctie,ahn_hoogte_m,ahn_relief}){
+    function setClickInfo({fgr,bodem,bodem_bron,gt,vocht}){
       document.getElementById('uiF').textContent = 'FGR: ' + (fgr || '—');
-
       const btxt = (bodem || '—') + (bodem_bron ? ` (${bodem_bron})` : '');
       document.getElementById('uiB').textContent = 'Bodem: ' + btxt;
-
-      const uiG = document.getElementById('uiG');
-      const gtTxt = gt || '—';
-      if (vocht) {
-        if (vocht_basis && vocht_ahn_correctie) {
-          uiG.textContent = 'Gt: ' + gtTxt + ' → ' + vocht_basis + ' → ' + vocht;
-        } else if (vocht_basis) {
-          uiG.textContent = 'Gt: ' + gtTxt + ' → ' + vocht;
-        } else {
-          uiG.textContent = 'Gt: ' + gtTxt + ' (vocht: ' + vocht + ')';
-        }
-      } else {
-        uiG.textContent = 'Gt: ' + gtTxt + ' (onbekend)';
-      }
-
-      const uiA = document.getElementById('uiA');
-      if (ahn_hoogte_m !== null && ahn_hoogte_m !== undefined) {
-        let h = Number(ahn_hoogte_m);
-        let txt = 'AHN: ' + (isFinite(h) ? h.toFixed(2) : ahn_hoogte_m) + ' m +NAP';
-        if (ahn_relief === 'hoogte') {
-          txt += ' · lokale hoogte (iets droger)';
-        } else if (ahn_relief === 'laagte') {
-          txt += ' · lokale laagte (iets natter)';
-        } else if (ahn_relief === 'vlak') {
-          txt += ' · vlak';
-        }
-        uiA.textContent = txt;
-      } else {
-        uiA.textContent = 'AHN: —';
-      }
+      document.getElementById('uiG').textContent = 'Gt: ' + (gt || '—') + (vocht ? ` → ${vocht}` : ' (onbekend)');
     }
 
     async function loadWms(){
@@ -935,7 +898,7 @@ def index() -> str:
       url.searchParams.set('exclude_invasief', document.getElementById('exInv').checked);
       const j = await (await fetch(url)).json();
 
-      setClickInfo({ fgr:j.fgr, bodem:j.bodem, bodem_bron:j.bodem_bron, gt:j.gt_code, vocht:j.vocht, vocht_basis:j.vocht_basis, vocht_ahn_correctie:j.vocht_ahn_correctie, ahn_hoogte_m:j.ahn_hoogte_m, ahn_relief:j.ahn_relief });
+      setClickInfo({ fgr:j.fgr, bodem:j.bodem, bodem_bron:j.bodem_bron, gt:j.gt_code, vocht:j.vocht });
 
       const data = { items: j.advies || [] };
       document.getElementById('count').textContent = (data.items.length||0) + ' resultaten (auto-filter)';
