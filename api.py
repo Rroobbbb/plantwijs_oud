@@ -15,32 +15,20 @@ import math
 import os
 import re
 import time
-from dataclasses import dataclass
+import urllib.parse
+import xml.etree.ElementTree as ET
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
-import xml.etree.ElementTree as ET
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pyproj import Transformer
 
-# ───────────────────── FastAPI app
-app = FastAPI(title="PlantWijs API", version="3.9.2")
-
-# CORS (zodat je lokaal kunt testen of met andere frontends)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # evt. beperken tot specifieke hosts
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ───────────────────── Headers / UA
-HEADERS = {"User-Agent": "PlantWijs/3.9.2"}
+# ───────────────────── PDOK endpoints
+HEADERS = {"User-Agent": "plantwijs/3.9.2"}
 FMT_JSON = "application/json;subtype=geojson"
 
 # WFS FGR
@@ -56,90 +44,58 @@ BODEM_WMS = "https://service.pdok.nl/bzk/bro-bodemkaart/wms/v1_0"
 # WMS Grondwaterspiegeldiepte (BRO)
 GWD_WMS = "https://service.pdok.nl/bzk/bro-grondwaterspiegeldiepte/wms/v2_0"
 
-# WMS AHN (hoogte)
-AHN_WMS = "https://service.pdok.nl/rws/ahn/wms/v1_0"
-
 # ───────────────────── Proj
 TX_WGS84_RD = Transformer.from_crs(4326, 28992, always_xy=True)
 TX_WGS84_WEB = Transformer.from_crs(4326, 3857, always_xy=True)
 
-# ──────────────── PlantWijs CSV
+# ───────────────────── Dataset cache
 DATA_PATHS = [
-    os.path.join(os.path.dirname(__file__), "plantwijs_full.csv"),
-    os.path.join(os.path.dirname(__file__), "plantwijs_full_v3.9.2.csv"),
-    os.path.join(os.path.dirname(__file__), "plantwijs_full_v3.9.csv"),
+    "out/plantwijs_full_semicolon.csv",
+    "out/plantwijs_full.csv",
 ]
+_CACHE: Dict[str, Any] = {"df": None, "mtime": None, "path": None}
 
-# ───────────────────── helpers
+def _detect_sep(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            head = f.read(4096)
+        return ";" if head.count(";") >= head.count(",") else ","
+    except Exception:
+        return ";"
 
-def _get(url: str, **kwargs) -> requests.Response:
-    kwargs.setdefault("headers", HEADERS)
-    kwargs.setdefault("timeout", 10)
-    return requests.get(url, **kwargs)
+def _load_df(path: str) -> pd.DataFrame:
+    sep = _detect_sep(path)
+    df = pd.read_csv(path, sep=sep, dtype=str, encoding_errors="ignore")
+    df.columns = [str(c).strip().lower().replace(" ", "_").replace("-", "_") for c in df.columns]
+    if "naam" not in df.columns and "nederlandse_naam" in df.columns:
+        df = df.rename(columns={"nederlandse_naam": "naam"})
+    if "wetenschappelijke_naam" not in df.columns:
+        for k in ("taxon", "species"):
+            if k in df.columns:
+                df = df.rename(columns={k: "wetenschappelijke_naam"})
+                break
+    for must in ("standplaats_licht", "vocht", "inheems", "invasief"):
+        if must not in df.columns:
+            df[must] = ""
+    return df
 
-# ───────────────────── FGR helpers
+def get_df() -> pd.DataFrame:
+    path = next((p for p in DATA_PATHS if os.path.exists(p)), None)
+    if not path:
+        raise FileNotFoundError("Geen dataset gevonden. Bouw eerst out/plantwijs_full_semicolon.csv met build_dataset.py")
+    m = os.path.getmtime(path)
+    if _CACHE["df"] is None or _CACHE["mtime"] != m or _CACHE["path"] != path:
+        df = _load_df(path)
+        _CACHE.update({"df": df, "mtime": m, "path": path})
+        print(f"[DATA] geladen: {path} — {len(df)} rijen, {df.shape[1]} kolommen")
+    return _CACHE["df"].copy()
 
-@dataclass
-class FgrFeature:
-    geom: List[Tuple[float, float]]  # lijst van (x,y)
-    name: str
+# ───────────────────── HTTP utils
+@lru_cache(maxsize=32)
+def _get(url: str) -> requests.Response:
+    return requests.get(url, headers=HEADERS, timeout=12)
 
-_FGR_CACHE: List[FgrFeature] = []
-
-
-def _load_fgr() -> List[FgrFeature]:
-    global _FGR_CACHE
-    if _FGR_CACHE:
-        return _FGR_CACHE
-    print("[FGR] laden FGR geometrie…")
-    feats: List[FgrFeature] = []
-    url = PDOK_FGR_WFS + "&request=GetFeature&typenames=fysischgeografischeregios:fysischgeografischeregios&outputFormat=" + FMT_JSON
-    r = _get(url)
-    r.raise_for_status()
-    data = r.json()
-    for f in data.get("features", []):
-        props = f.get("properties") or {}
-        naam = props.get("NAAM") or props.get("naam") or "Onbekend"
-        geom = f.get("geometry") or {}
-        coords = geom.get("coordinates") or []
-        # geometrie kan MultiPolygon of Polygon zijn
-        if geom.get("type") == "MultiPolygon":
-            # flatten
-            pl = []
-            for poly in coords:
-                for ring in poly:
-                    pl.extend([(float(x), float(y)) for x, y in ring])
-            if pl:
-                feats.append(FgrFeature(pl, naam))
-        elif geom.get("type") == "Polygon":
-            pl = []
-            for ring in coords:
-                pl.extend([(float(x), float(y)) for x, y in ring])
-            if pl:
-                feats.append(FgrFeature(pl, naam))
-    _FGR_CACHE = feats
-    print(f"[FGR] geladen: {len(feats)} regio's")
-    return feats
-
-
-def _point_in_poly(x: float, y: float, poly: List[Tuple[float, float]]) -> bool:
-    # standaard ray-casting algo
-    inside = False
-    n = len(poly)
-    if n < 3:
-        return False
-    x1, y1 = poly[0]
-    for i in range(1, n + 1):
-        x2, y2 = poly[i % n]
-        if ((y1 > y) != (y2 > y)) and (x < (x2 - x1) * (y - y1) / (y2 - y1 + 1e-9) + x1):
-            inside = not inside
-        x1, y1 = x2, y2
-    return inside
-
-# ───────────────────── WMS metadata
-
-_WMSMETA: Dict[str, Dict[str, str]] = {}
-
+@lru_cache(maxsize=16)
 def _capabilities(url: str) -> Optional[ET.Element]:
     try:
         r = _get(f"{url}?service=WMS&request=GetCapabilities")
@@ -154,18 +110,35 @@ def _find_layer_name(url: str, want: List[str]) -> Optional[Tuple[str, str]]:
     root = _capabilities(url)
     if root is None:
         return None
-    layers = root.findall(".//{http://www.opengis.net/wms}Layer")
-    best = None
+    layers = root.findall(".//{*}Layer")
+    cand: List[Tuple[str,str]] = []  # (name,title)
     for layer in layers:
-        name_el = layer.find("{http://www.opengis.net/wms}Name")
-        title_el = layer.find("{http://www.opengis.net/wms}Title")
-        name = (name_el.text if name_el is not None else "") or ""
-        title = (title_el.text if title_el is not None else "") or ""
-        s = (name + " " + title).lower()
-        if all(w.lower() in s for w in want):
-            best = (name, title or name)
-            break
-    return best
+        name_el = layer.find("{*}Name")
+        title_el = layer.find("{*}Title")
+        name = (name_el.text if name_el is not None else "")
+        title = (title_el.text if title_el is not None else "")
+        if not name and not title:
+            continue
+        cand.append((name, title))
+    lwant = [w.lower() for w in want]
+    # 1) match op Title
+    for name, title in cand:
+        t = (title or "").lower()
+        if any(w in t for w in lwant) and name:
+            return name, title
+    # 2) match op Name
+    for name, title in cand:
+        n = (name or "").lower()
+        if any(w in n for w in lwant) and name:
+            return name, title
+    # 3) fallback: eerste met name
+    for name, title in cand:
+        if name:
+            return name, title
+    return None
+
+# Resolve alle laagnamen één keer bij startup
+_WMSMETA: Dict[str, Dict[str, str]] = {}
 
 def _resolve_layers() -> None:
     global _WMSMETA
@@ -175,15 +148,12 @@ def _resolve_layers() -> None:
     gt = _find_layer_name(GWD_WMS, ["grondwatertrappen", "gt"]) or ("BRO Grondwaterspiegeldiepte Grondwatertrappen Gt", "Gt")
     ghg = _find_layer_name(GWD_WMS, ["ghg"]) or ("BRO Grondwaterspiegeldiepte GHG", "GHG")
     glg = _find_layer_name(GWD_WMS, ["glg"]) or ("BRO Grondwaterspiegeldiepte GLG", "GLG")
-    ahn = _find_layer_name(AHN_WMS, ["ahn", "dtm", "maaiveld"]) or ("ahn", "AHN")
     meta["fgr"] = {"url": FGR_WMS, "layer": fgr[0], "title": fgr[1]}
     meta["bodem"] = {"url": BODEM_WMS, "layer": bodem[0], "title": bodem[1]}
     meta["gt"] = {"url": GWD_WMS, "layer": gt[0], "title": gt[1]}
     meta["ghg"] = {"url": GWD_WMS, "layer": ghg[0], "title": ghg[1]}
     meta["glg"] = {"url": GWD_WMS, "layer": glg[0], "title": glg[1]}
-    meta["ahn"] = {"url": AHN_WMS, "layer": ahn[0], "title": ahn[1]}
     _WMSMETA = meta
-
     print("[WMS] resolved:", meta)
 
 _resolve_layers()
@@ -197,20 +167,35 @@ def _wfs(url: str) -> List[dict]:
             return []
         if "json" not in r.headers.get("Content-Type", "").lower():
             return []
-        return (r.json() or {}).get("features") or []
-    except Exception as e:
-        print("[WFS] fout:", e)
+        return (r.json() or {}).get("features", [])
+    except Exception:
         return []
 
-# WMS → featureinfo
+_kv_re = re.compile(r"^\s*([A-Za-z0-9_\-\. ]+?)\s*[:=]\s*(.+?)\s*$")
+
+def _parse_kv_text(text: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for line in (text or "").splitlines():
+        m = _kv_re.match(line)
+        if m:
+            out[m.group(1).strip()] = m.group(2).strip()
+    if not out:
+        stripped = re.sub(r"<[^>]+>", "\n", text)
+        for line in stripped.splitlines():
+            m = _kv_re.match(line)
+            if m:
+                out[m.group(1).strip()] = m.group(2).strip()
+    return out
+
+# robuuste GetFeatureInfo (gebruikt dynamische laagnamen uit _WMSMETA)
 _DEF_INFO_FORMATS = [
     "application/json",
+    "application/geo+json",
+    "application/json;subtype=geojson",
     "application/vnd.ogc.gml",
-    "application/vnd.ogc.wms_xml",
     "text/xml",
     "text/plain",
 ]
-
 
 def _wms_getfeatureinfo(base_url: str, layer: str, lat: float, lon: float) -> dict | None:
     cx, cy = TX_WGS84_WEB.transform(lon, lat)
@@ -252,41 +237,41 @@ def fgr_from_point(lat: float, lon: float) -> str | None:
     if not (0 < x < 300_000 and 300_000 < y < 620_000):
         return None
     b = 100
-    x1, y1, x2, y2 = round(x-b), round(y-b), round(x+b), round(y+b)
-    feats = _load_fgr()
-    for f in feats:
-        for (px, py) in f.geom:
-            if x1 <= px <= x2 and y1 <= py <= y2:
-                if _point_in_poly(x, y, f.geom):
-                    return f.name
+    x1, y1, x2, y2 = round(x-b, 3), round(y-b, 3), round(x+b, 3), round(y+b, 3)
+    layer_name = "fysischgeografischeregios:fysischgeografischeregios"
+    url_rd = (
+        f"{PDOK_FGR_WFS}&request=GetFeature&typenames={layer_name}"
+        f"&outputFormat={FMT_JSON}&srsName=EPSG:28992&bbox={x1},{y1},{x2},{y2}&count=1"
+    )
+    feats = _wfs(url_rd)
+    if feats:
+        return feats[0].get("properties", {}).get("fgr")
+    cql = urllib.parse.quote_plus(f"INTERSECTS(geometry,POINT({lon} {lat}))")
+    url_pt = (
+        f"{PDOK_FGR_WFS}&request=GetFeature&typenames={layer_name}"
+        f"&outputFormat={FMT_JSON}&srsName=EPSG:4326&cql_filter={cql}&count=1"
+    )
+    feats = _wfs(url_pt)
+    if feats:
+        return feats[0].get("properties", {}).get("fgr")
     return None
 
-_SOIL_MAP = {
-    "zand": "zand",
-    "lemig zand": "zand",
-    "klei": "klei",
-    "zavel": "leem",
-    "leem": "leem",
-    "veen": "veen",
-    "moerig": "veen",
+_SOIL_TOKENS = {
+    "veen": {"veen"},
+    "klei": {"klei", "zware klei", "lichte klei"},
+    # NL: zavel ~ leem/loam
+    "leem": {"leem", "loess", "löss", "zavel"},
+    "zand": {"zand", "dekzand"},
 }
 
-def _soil_from_text(s: str) -> Optional[str]:
-    low = s.lower()
-    for k, v in _SOIL_MAP.items():
-        if k in low:
-            return v
+def _soil_from_text(text: str) -> Optional[str]:
+    t = (text or "").lower()
+    for soil, keys in _SOIL_TOKENS.items():
+        for k in keys:
+            if k in t:
+                return soil
     return None
 
-def _parse_kv_text(text: str) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or ":" not in line:
-            continue
-        k, v = line.split(":", 1)
-        out[k.strip()] = v.strip()
-    return out
 
 def bodem_from_bodemkaart(lat: float, lon: float) -> Tuple[Optional[str], dict]:
     layer = _WMSMETA.get("bodem", {}).get("layer") or "Bodemvlakken"
@@ -307,50 +292,68 @@ def bodem_from_bodemkaart(lat: float, lon: float) -> Tuple[Optional[str], dict]:
         for k in ("grondsoort", "BODEM", "bodemtype", "BODEMNAAM", "NAAM", "omschrijving",
                   "first_soilname", "normal_soilprofile_name"):
             if k in kv and kv[k]:
-                val = str(kv[k])
+                val = kv[k]
                 return _soil_from_text(val) or val, props
+        so = _soil_from_text(props["_text"]) or None
+        return so, props
 
     return None, props
 
-_GT_CODE_MAP = {
-    # Bron: BRO-documentatie → 1..19 naar Ia..VIIId
-    "1": "Ia",  "2": "Ib",  "3": "IIa", "4": "IIb",
-    "5": "IIIa","6": "IIIb","7": "IVa","8": "IVb",
-    "9": "V",   "10":"VI",  "11":"VII","12":"VIII",
-    "13":"IIIc","14":"IVc", "15":"Vb", "16":"VIb",
-    "17":"VIIb","18":"VIIIb","19":"VIIIc",
+
+# ───────────────────── PDOK value → vochtklasse
+
+# Mapping 1..19 → officiële Gt-code (Ia..VIIId)
+GT_ORDINAL_TO_CODE = {
+    1:"Ia",  2:"Ib",  3:"IIa", 4:"IIb", 5:"IIc",
+    6:"IIIa",7:"IIIb",
+    8:"IVu", 9:"IVc",
+    10:"Vao",11:"Vad",12:"Vbo",13:"Vbd",
+    14:"VIo",15:"VId",
+    16:"VIIo",17:"VIId",
+    18:"VIIIo",19:"VIIId",
 }
 
-def _gt_pretty(raw: Optional[str]) -> Optional[str]:
-    if raw is None:
+def _gt_pretty(gt: Optional[str]) -> Optional[str]:
+    """Geef officiële Gt-code (Ia..VIIId) terug voor input 'VIIId', 'ivc' of ordinaal '1'..'19'."""
+    if not gt:
         return None
-    s = str(raw).strip()
-    if not s:
-        return None
-    # als het al iets als "IIIc" is, laat zo
-    if re.match(r"^[IVX]+[a-z]?$", s, re.I):
-        return s.upper()
-    # anders value_list mapping
-    if s in _GT_CODE_MAP:
-        return _GT_CODE_MAP[s]
-    return s
+    s = str(gt).strip()
+    if s.isdigit():
+        try:
+            v = int(float(s.replace(",", ".")))
+        except Exception:
+            return s
+        return GT_ORDINAL_TO_CODE.get(v, s)
+    return s.upper()
 
-def _vochtklasse_from_gt_code(raw: Optional[str]) -> Optional[str]:
-    code = _gt_pretty(raw)
-    if not code:
+def _vochtklasse_from_gt_code(gt: Optional[str]) -> Optional[str]:
+    """Zet BRO-Gt code om naar onze vochtklassen (zeer nat .. zeer droog)."""
+    if not gt:
         return None
-    c = code.upper()
-    if c.startswith(("I", "II")):
-        return "zeer nat"
-    if c.startswith(("III", "IV")):
-        return "nat"
-    if c.startswith("V"):
-        return "vochtig"
-    if c.startswith("VI"):
-        return "droog"
-    if c.startswith("VII") or c.startswith("VIII"):
-        return "zeer droog"
+    s = str(gt).strip()
+    # Ordinale 1..19
+    if s.isdigit():
+        try:
+            v = int(float(s.replace(",", ".")))
+        except Exception:
+            return None
+        if 1 <= v <= 5:    return "zeer nat"   # I(a,b), II(a,b,c)
+        if 6 <= v <= 7:    return "nat"        # III(a,b)
+        if 8 <= v <= 13:   return "vochtig"    # IV(u,c), V(a,o,d,b)
+        if 14 <= v <= 15:  return "droog"      # VI(o,d)
+        if 16 <= v <= 19:  return "zeer droog" # VII(o,d), VIII(o,d)
+        return None
+    # Romeins
+    s_up = s.upper()
+    m = re.match(r"^(I{1,3}|IV|V|VI|VII|VIII)", s_up)
+    base = m.group(1) if m else s_up
+    if base in ("I", "II"): return "zeer nat"
+    if base == "III":       return "nat"
+    if base in ("IV", "V"): return "vochtig"
+    if base == "VI":        return "droog"
+    if base in ("VII","VIII"): return "zeer droog"
     return None
+
 
 def vocht_from_gwt(lat: float, lon: float) -> Tuple[Optional[str], dict, Optional[str]]:
     gt_layer = _WMSMETA.get("gt", {}).get("layer") or "BRO Grondwaterspiegeldiepte Grondwatertrappen Gt"
@@ -403,39 +406,6 @@ def vocht_from_gwt(lat: float, lon: float) -> Tuple[Optional[str], dict, Optiona
     return klass, props, _gt_pretty(gt_raw)
 
 
-def ahn_from_point(lat: float, lon: float) -> Tuple[Optional[float], dict]:
-    """Geef AHN-hoogte (m t.o.v. NAP) en ruwe properties terug voor de locatie."""
-    meta = _WMSMETA.get("ahn") or {}
-    base_url = meta.get("url") or AHN_WMS
-    layer = meta.get("layer") or "ahn"
-    props = _wms_getfeatureinfo(base_url, layer, lat, lon) or {}
-
-    val: Optional[float] = None
-
-    # 1) Probeer directe numerieke properties (bijv. GRAY_INDEX, value)
-    for k, v in props.items():
-        if k == "_text" or v is None:
-            continue
-        s = str(v).strip().replace(",", ".")
-        try:
-            val = float(s)
-            break
-        except ValueError:
-            continue
-
-    # 2) Fallback: tekst pars
-    if val is None and "_text" in props:
-        kv = _parse_kv_text(props.get("_text") or "") or {}
-        for v in kv.values():
-            s = str(v).strip().replace(",", ".")
-            try:
-                val = float(s)
-                break
-            except ValueError:
-                continue
-
-    return val, props
-
 # ───────────────────── filtering helpers
 
 def _contains_ci(s: Any, needle: str) -> bool:
@@ -452,39 +422,35 @@ def _match_multival(cell: Any, choices: List[str]) -> bool:
     return bool(tokens.intersection(want))
 
 def _match_bodem_row(row: pd.Series, keuzes: List[str]) -> bool:
-    bodem = str(row.get("bodem") or "").strip().lower()
     if not keuzes:
         return True
-    for k in keuzes:
-        k = k.strip().lower()
-        if not k:
-            continue
-        if k in bodem:
-            return True
-    return False
+    low = [k.lower() for k in keuzes]
+    if "bodem" in row and _match_multival(row.get("bodem"), low):
+        return True
+    gs = str(row.get("grondsoorten", "")).lower()
+    cats = set()
+    if "zand" in gs: cats.add("zand")
+    if "klei" in gs: cats.add("klei")
+    if any(w in gs for w in ("leem","löss","loess")): cats.add("leem")
+    if "veen" in gs: cats.add("veen")
+    return bool(set(low).intersection(cats))
 
-# ───────────────────── Data loading
-
-@lru_cache(maxsize=1)
-def get_df() -> pd.DataFrame:
-    for path in DATA_PATHS:
-        if os.path.exists(path):
-            df = pd.read_csv(path, sep=";", dtype=str)
-            print(f"[DATA] geladen: {path} ({len(df)} rijen)")
-            return df
-    raise FileNotFoundError("Geen plantwijs_full*.csv gevonden")
-
-# ───────────────────── JSON cleaning
+# ───────────────────── app + cleaners
+app = FastAPI(title="PlantWijs API v3.9.2")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET","POST"], allow_headers=["*"])
 
 def _clean(o: Any) -> Any:
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
     if isinstance(o, dict):
-        return {k: _clean(v) for k, v in o.items() if v is not None}
+        return {k:_clean(v) for k,v in o.items()}
     if isinstance(o, list):
         return [_clean(v) for v in o]
-    if isinstance(o, float):
-        if math.isnan(o) or math.isinf(o):
+    try:
+        if pd.isna(o):  # type: ignore[arg-type]
             return None
-        return o
+    except Exception:
+        pass
     return o
 
 # ───────────────────── API: diagnose/meta
@@ -504,43 +470,39 @@ def api_diag(service: str = Query(..., pattern="^(bodem|gt|ghg|glg|fgr)$"), lat:
 # ───────────────────── API: data
 @app.get("/api/plants")
 def api_plants(
-    q: str = Query("", description="Zoekterm in naam/wetenschappelijke naam"),
-    licht: List[str] = Query([], description="Licht: schaduw, halfschaduw, zon"),
-    vocht: List[str] = Query([], description="Vocht: zeer nat, nat, vochtig, droog, zeer droog"),
-    bodem: List[str] = Query([], description="Bodem: zand, klei, leem, veen"),
-    inheems_only: bool = Query(True, description="Alleen inheemse soorten"),
-    exclude_invasief: bool = Query(True, description="Sluit invasieve soorten uit"),
-    limit: int = Query(500, ge=1, le=1000),
+    q: str = Query(""),
+    inheems_only: bool = Query(True),
+    exclude_invasief: bool = Query(True),
+    licht: List[str] = Query(default=[]),
+    vocht: List[str] = Query(default=[]),
+    bodem: List[str] = Query(default=[]),
+    limit: int = Query(200, ge=1, le=1000),
+    sort: str = Query("naam"),
+    desc: bool = Query(False),
 ):
-    t0 = time.time()
     df = get_df()
-
+    if q:
+        df = df[df.apply(lambda r: _contains_ci(r.get("naam"), q) or _contains_ci(r.get("wetenschappelijke_naam"), q), axis=1)]
     if inheems_only and "inheems" in df.columns:
         df = df[df["inheems"].astype(str).str.lower() == "ja"]
     if exclude_invasief and "invasief" in df.columns:
         df = df[(df["invasief"].astype(str).str.lower() != "ja") | (df["invasief"].isna())]
-
-    if q:
-        qlow = q.lower()
-        mask = (
-            df["naam"].fillna("").str.lower().str.contains(qlow)
-            | df["wetenschappelijke_naam"].fillna("").str.lower().str.contains(qlow)
-        )
-        df = df[mask]
-
     if licht:
         df = df[df["standplaats_licht"].map(lambda v: _match_multival(v, licht))]
     if vocht:
         df = df[df["vocht"].map(lambda v: _match_multival(v, vocht))]
     if bodem:
         df = df[df.apply(lambda r: _match_bodem_row(r, bodem), axis=1)]
-
+    if sort in df.columns:
+        df = df.sort_values(sort, ascending=not desc)
     cols = [c for c in (
         "naam","wetenschappelijke_naam","inheems","invasief","standplaats_licht","vocht","bodem",
         "ellenberg_l","ellenberg_f","ellenberg_t","ellenberg_n","ellenberg_r","ellenberg_s",
+        "ellenberg_l_min","ellenberg_l_max","ellenberg_f_min","ellenberg_f_max",
+        "ellenberg_t_min","ellenberg_t_max","ellenberg_n_min","ellenberg_n_max",
+        "ellenberg_r_min","ellenberg_r_max","ellenberg_s_min","ellenberg_s_max",
         "hoogte","breedte","winterhardheidszone","grondsoorten","ecowaarde"
     ) if c in df.columns]
-
     items = df[cols].head(limit).to_dict(orient="records")
     return JSONResponse(_clean({"count": int(len(df)), "items": items}))
 
@@ -556,7 +518,6 @@ def advies_geo(
     fgr = fgr_from_point(lat, lon) or "Onbekend"
     bodem_raw, props_bodem = bodem_from_bodemkaart(lat, lon)
     vocht_raw, props_gwt, gt_code = vocht_from_gwt(lat, lon)
-    ahn_val, props_ahn = ahn_from_point(lat, lon)
 
     # Belangrijk: géén default op vocht als het onbekend is
     bodem_val = bodem_raw or "leem"  # bodem blijft zoals in v3.9
@@ -587,8 +548,6 @@ def advies_geo(
         "gt_code": gt_code,                     # ← altijd 'Ia'..'VIIId'
         "vocht": vocht_raw,                     # kan None zijn
         "vocht_bron": "BRO Gt/GLG WMS" if vocht_raw else "onbekend",
-        "ahn": ahn_val,
-        "ahn_bron": "AHN WMS" if ahn_val is not None else "onbekend",
         "advies": items,
         "elapsed_ms": int((time.time()-t0)*1000),
     }
@@ -611,13 +570,13 @@ def index() -> str:
     :root { --bg:#0b1321; --panel:#0f192e; --muted:#9aa4b2; --fg:#e6edf3; --border:#1c2a42; }
     * { box-sizing:border-box; }
     body { margin:0; font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial; background:var(--bg); color:var(--fg); }
-    header { padding:10px 14px; border-bottom:1px solid var(--border); background:#050815; display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    header { padding:10px 14px; border-bottom:1px solid var(--border); position:sticky; top:0; background:var(--bg); z-index:10; display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
     header h1 { margin:0; font-size:18px; }
-    .wrap { display:grid; grid-template-columns:minmax(520px, 68%) minmax(320px, 32%); gap:12px; padding:12px; height:calc(100vh - 64px); } /* alleen rechter kolom scrolt */
+    .wrap { display:grid; grid-template-columns:minmax(520px, 68%) 1fr; gap:12px; padding:12px; height:calc(100vh - 64px); } /* alleen rechter kolom scrolt */
     #map { height:100%; border-radius:12px; border:1px solid var(--border); box-shadow:0 0 0 1px rgba(255,255,255,.05) inset; }
     .panel { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:12px; }
     .panel-right { height:100%; overflow:auto; }
-    .checks label { display:inline-flex; gap:6px; align-items:center; background:#0b1226; border:1px solid #1f2c49; padding:6px 8px; border-radius:8px; margin-right:6px; }
+    .checks label { display:inline-flex; gap:6px; align-items:center; background:#0c1730; border:1px solid #1f2c49; padding:6px 8px; border-radius:8px; margin-right:6px; }
     input[type=checkbox] { accent-color:#5aa9ff; }
     .muted { color:var(--muted); }
     .chips { display:flex; gap:6px; flex-wrap:wrap; margin:8px 0; }
@@ -632,7 +591,7 @@ def index() -> str:
 <body>
   <header>
     <h1>🌿 PlantWijs</h1>
-    <button id="btnLocate" class="btn" style="background:#11325a;color:#e6edf3;border:1px solid #27518a;padding:6px 10px;border-radius:8px;cursor:pointer;">📍 Mijn locatie</button>
+    <button id="btnLocate" class="btn" style="background:#11325a;color:#e6edf3;border:1px solid #1f2c49;padding:6px 10px;border-radius:8px;cursor:pointer;">📍 Mijn locatie</button>
     <label class="muted"><input id="inhOnly" type="checkbox" checked> alleen inheemse</label>
     <label class="muted"><input id="exInv" type="checkbox" checked> sluit invasieve uit</label>
     <div class="checks">
@@ -643,11 +602,11 @@ def index() -> str:
     </div>
     <div class="checks">
       <span class="muted">Vocht:</span>
-      <label><input type="checkbox" name="vocht" value="zeer nat"> zeer nat</label>
-      <label><input type="checkbox" name="vocht" value="nat"> nat</label>
-      <label><input type="checkbox" name="vocht" value="vochtig"> vochtig</label>
-      <label><input type="checkbox" name="vocht" value="droog"> droog</label>
       <label><input type="checkbox" name="vocht" value="zeer droog"> zeer droog</label>
+      <label><input type="checkbox" name="vocht" value="droog"> droog</label>
+      <label><input type="checkbox" name="vocht" value="vochtig"> vochtig</label>
+      <label><input type="checkbox" name="vocht" value="nat"> nat</label>
+      <label><input type="checkbox" name="vocht" value="zeer nat"> zeer nat</label>
     </div>
     <div class="checks">
       <span class="muted">Bodem:</span>
@@ -680,24 +639,27 @@ def index() -> str:
   </div>
 
   <script>
-    const ui = { meta:null };
-    const overlays = {};
-    const map = L.map('map', {
-      center:[52.1,5.2],
-      zoom:8,
-      zoomControl:true,
-      attributionControl:false
-    });
+    const map = L.map('map').setView([52.1, 5.3], 8);
+    const base = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap' }).addTo(map);
 
-    // Basemap
-    const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom:19,
-      attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>'
-    }).addTo(map);
+    let overlays = {};
+    let ui = { meta:null };
 
-    // Coole info/legenda control rechtsboven
+    function html(s){ return (s==null?'':String(s)).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;') }
+    function getChecked(name){ return Array.from(document.querySelectorAll('input[name="'+name+'"]:checked')).map(x=>x.value) }
+    function renderChips(){
+      const ctn = document.getElementById('chips');
+      const chips = [];
+      for(const [lbl,name] of [['licht','licht'],['vocht','vocht'],['bodem','bodem']]){
+        const vals = getChecked(name);
+        if(vals.length){ chips.push(`<span class="chip">${lbl}: ${vals.map(html).join(' / ')}</span>`); }
+      }
+      ctn.innerHTML = chips.join(' ');
+    }
+
+    // Info-control (alleen klik-info)
     const InfoCtl = L.Control.extend({
-      onAdd: function(map){
+      onAdd: function() {
         const div = L.DomUtil.create('div', 'pw-ctl');
         div.innerHTML = `
           <h3>Legenda & info</h3>
@@ -705,7 +667,6 @@ def index() -> str:
             <div id="uiF" class="muted">FGR: —</div>
             <div id="uiB" class="muted">Bodem: —</div>
             <div id="uiG" class="muted">Gt: —</div>
-            <div id="uiH" class="muted">AHN hoogte: —</div>
           </div>
         `;
         L.DomEvent.disableClickPropagation(div);
@@ -714,23 +675,18 @@ def index() -> str:
     });
     const infoCtl = new InfoCtl({ position:'topright' }).addTo(map);
 
-    function setClickInfo({fgr,bodem,bodem_bron,gt,vocht,ahn}){
+    function setClickInfo({fgr,bodem,bodem_bron,gt,vocht}){
       document.getElementById('uiF').textContent = 'FGR: ' + (fgr || '—');
       const btxt = (bodem || '—') + (bodem_bron ? ` (${bodem_bron})` : '');
       document.getElementById('uiB').textContent = 'Bodem: ' + btxt;
       document.getElementById('uiG').textContent = 'Gt: ' + (gt || '—') + (vocht ? ` → ${vocht}` : ' (onbekend)');
-      const ahnTxt = (ahn == null) ? 'AHN hoogte: —' : `AHN hoogte: ${ahn.toFixed(2)} m NAP`;
-      document.getElementById('uiH').textContent = ahnTxt;
     }
 
-
-    
     async function loadWms(){
       ui.meta = await (await fetch('/api/wms_meta')).json();
-      const make = (m, opacity)=> L.tileLayer.wms(m.url, { layers:m.layer, styles:'', format:'image/png', transparent:true, opacity: opacity, version:'1.3.0', crs: L.CRS.EPSG3857 });
+      const make = (m, opacity)=> L.tileLayer.wms(m.url, { layers: m.layer, format:'image/png', transparent: true, opacity: opacity, version:'1.3.0', crs: L.CRS.EPSG3857 });
       overlays['BRO Bodemkaart (Bodemvlakken)'] = make(ui.meta.bodem, 0.55).addTo(map);
       overlays['BRO Grondwatertrappen (Gt)']    = make(ui.meta.gt,    0.45).addTo(map);
-      overlays['AHN hoogte']                    = make(ui.meta.ahn,   0.45).addTo(map);
       overlays['FGR']                           = make(ui.meta.fgr,   0.45).addTo(map);
 
       // Lagen-schakelaar: alleen overlays, linksonder
@@ -761,43 +717,42 @@ def index() -> str:
       for(const v of getChecked('licht')) url.searchParams.append('licht', v);
       for(const v of getChecked('vocht')) url.searchParams.append('vocht', v);
       for(const v of getChecked('bodem')) url.searchParams.append('bodem', v);
-      const res = await fetch(url);
-      const data = await res.json();
-      document.getElementById('count').textContent = (data.count||0) + ' resultaten';
-      renderRows(data.items||[]);
-    }
-
-    function getChecked(name){
-      return Array.from(document.querySelectorAll(`input[name="${name}"]:checked`)).map(el=>el.value);
+      url.searchParams.set('limit','300');
+      const r = await fetch(url); return r.json();
     }
 
     function renderRows(items){
-      const tbody = document.querySelector('#tbl tbody');
-      tbody.innerHTML = '';
-      for(const it of items){
-        const tr = document.createElement('tr');
-        tr.innerHTML = `
-          <td style="padding:6px 10px;border-bottom:1px solid #182742;">${it.naam||''}</td>
-          <td style="padding:6px 10px;border-bottom:1px solid #182742;">${it.wetenschappelijke_naam||''}</td>
-          <td style="padding:6px 10px;border-bottom:1px solid #182742;">${it.standplaats_licht||''}</td>
-          <td style="padding:6px 10px;border-bottom:1px solid #182742;">${it.vocht||''}</td>
-          <td style="padding:6px 10px;border-bottom:1px solid #182742;">${it.bodem||''}</td>
-          <td style="padding:6px 10px;border-bottom:1px solid #182742;">${it.winterhardheidszone||''}</td>
-        `;
-        tbody.appendChild(tr);
-      }
+      const tb = document.querySelector('#tbl tbody');
+      tb.innerHTML = items.map(r=>`
+        <tr>
+          <td style="padding:8px 10px;border-bottom:1px solid #182742;"><strong>${html(r.naam||'')}</strong></td>
+          <td class="muted" style="padding:8px 10px;border-bottom:1px solid #182742;">${html(r.wetenschappelijke_naam||'')}</td>
+          <td style="padding:8px 10px;border-bottom:1px solid #182742;">${html(r.standplaats_licht||'')}</td>
+          <td style="padding:8px 10px;border-bottom:1px solid #182742;">${html(r.vocht||'')}</td>
+          <td style="padding:8px 10px;border-bottom:1px solid #182742;">${html(r.bodem||r.grondsoorten||'')}</td>
+          <td style="padding:8px 10px;border-bottom:1px solid #182742;">${html(r.winterhardheidszone||'')}</td>
+        </tr>`).join('');
+    }
+
+    async function refresh(){
+      renderChips();
+      const data = await fetchList();
+      document.getElementById('count').textContent = data.count + ' resultaten (eerste ' + data.items.length + ')';
+      renderRows(data.items||[]);
     }
 
     map.on('click', async (e)=>{
-      const { lat, lng:lon } = e.latlng;
+      if(window._marker) window._marker.remove();
+      window._marker = L.marker(e.latlng).addTo(map);
+
       const url = new URL(location.origin + '/advies/geo');
-      url.searchParams.set('lat', lat);
-      url.searchParams.set('lon', lon);
+      url.searchParams.set('lat', e.latlng.lat);
+      url.searchParams.set('lon', e.latlng.lng);
       url.searchParams.set('inheems_only', document.getElementById('inhOnly').checked);
       url.searchParams.set('exclude_invasief', document.getElementById('exInv').checked);
       const j = await (await fetch(url)).json();
 
-      setClickInfo({ fgr:j.fgr, bodem:j.bodem, bodem_bron:j.bodem_bron, gt:j.gt_code, vocht:j.vocht, ahn:j.ahn });
+      setClickInfo({ fgr:j.fgr, bodem:j.bodem, bodem_bron:j.bodem_bron, gt:j.gt_code, vocht:j.vocht });
 
       const data = { items: j.advies || [] };
       document.getElementById('count').textContent = (data.items.length||0) + ' resultaten (auto-filter)';
@@ -805,20 +760,20 @@ def index() -> str:
     });
 
     document.getElementById('btnLocate').addEventListener('click', ()=>{
-      if(!navigator.geolocation){ alert('Geolocatie niet ondersteund'); return; }
-      navigator.geolocation.getCurrentPosition(async pos=>{
-        const lat = pos.coords.latitude;
-        const lon = pos.coords.longitude;
+      if(!navigator.geolocation){ alert('Geolocatie niet ondersteund.'); return; }
+      navigator.geolocation.getCurrentPosition(pos=>{
+        const lat = pos.coords.latitude, lon = pos.coords.longitude;
+        map.setView([lat,lon], 14);
         if(window._marker) window._marker.remove(); window._marker = L.marker([lat,lon]).addTo(map);
         map.fire('click', { latlng:{ lat, lng:lon } });
       }, err=>{ alert('Kon locatie niet ophalen'); });
     });
 
     for(const el of document.querySelectorAll('input[name="licht"], input[name="vocht"], input[name="bodem"], #inhOnly, #exInv')){
-      el.addEventListener('change', fetchList);
+      el.addEventListener('change', refresh);
     }
 
-    loadWms().then(fetchList);
+    loadWms().then(refresh);
   </script>
 </body>
 </html>
