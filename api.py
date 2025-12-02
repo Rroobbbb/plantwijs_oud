@@ -421,44 +421,58 @@ def gmm_from_wms(lat: float, lon: float) -> Tuple[Optional[str], dict]:
     layer = _WMSMETA.get("gmm", {}).get("layer") or "geomorphological_area"
     props = _wms_getfeatureinfo(GMM_WMS, layer, lat, lon) or {}
 
-    def _first_code(d: dict) -> Optional[str]:
-        for k, v in d.items():
-            s = str(v).strip()
-            if not s:
-                continue
-            # Sla expliciet "Nee" over: dat betekent dat er geen geomorfologie-informatie is
-            if s.lower() == "nee":
-                continue
-            # Sla XML-blobs / msGMLOutput-doorverwijzingen over
-            if s.lstrip().startswith("<?xml") or "msGMLOutput" in s:
-                continue
-            # Geef voorkeur aan waarden met een letter (klassieke GMM-code: cijfer-letter-cijfer)
-            if re.search(r"[A-Za-z]", s):
-                return s
+    def _norm_key(k: str) -> str:
+        return k.lower().replace("_", "").replace("-", "")
+
+    def _first_from_keys(d: dict, candidates) -> Optional[str]:
+        if not d:
+            return None
+        kl = { _norm_key(k): k for k in d.keys() }
+        for wanted in candidates:
+            want_norm = wanted.lower().replace("_", "").replace("-", "")
+            for nk, orig in kl.items():
+                if want_norm in nk:
+                    v = d.get(orig)
+                    if v is None:
+                        continue
+                    s = str(v).strip()
+                    if not s:
+                        continue
+                    # filter waardes die we expliciet niet willen tonen
+                    sl = s.lower()
+                    if sl == "nee":
+                        continue
+                    if s.lstrip().startswith("<?xml") or "msGMLOutput" in s:
+                        continue
+                    if sl.startswith("geom50000"):
+                        continue
+                    return s
         return None
 
-    val: Optional[str] = None
-    if props:
-        val = _first_code(props)
+    # 1) Probeer rechtstreeks uit props de landvormsubgroep-code te halen
+    prefer_code_keys = [
+        "landform_subgroup_code",
+        "landformsubgroup_code",
+        "landvormsubgroep_code",
+        "landvormsubgroepcode",
+    ]
+    val: Optional[str] = _first_from_keys(props, prefer_code_keys)
+
+    # 2) Zo niet, kijk of _text key/value-achtige info bevat
     if val is None and "_text" in props:
         kv = _parse_kv_text(props.get("_text", "")) or {}
-        val = _first_code(kv)
-        if val is None:
-            # Laatste redmiddel: probeer een code-achtige combinatie uit de tekst te vissen
-            m = re.search(r"([0-9]+[A-Za-z][0-9]+)", str(props.get("_text", "")))
-            if m:
-                cand = m.group(1).strip()
-                # Filter ook hier "Nee" / lege / XML-achtige waarden weg
-                if cand and cand.lower() != "nee" and not cand.lstrip().startswith("<?xml") and "msGMLOutput" not in cand:
-                    val = cand
+        val = _first_from_keys(kv, prefer_code_keys)
 
     if not val:
         return None, props
 
     sval = str(val).strip()
-    if not sval or sval.lower() == "nee":
+    sl = sval.lower()
+    if not sval or sl == "nee":
         return None, props
     if sval.lstrip().startswith("<?xml") or "msGMLOutput" in sval:
+        return None, props
+    if sl.startswith("geom50000"):
         return None, props
 
     return sval, props
