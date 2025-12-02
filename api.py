@@ -426,6 +426,12 @@ def gmm_from_wms(lat: float, lon: float) -> Tuple[Optional[str], dict]:
             s = str(v).strip()
             if not s:
                 continue
+            # Sla expliciet "Nee" over: dat betekent dat er geen geomorfologie-informatie is
+            if s.lower() == "nee":
+                continue
+            # Sla XML-blobs / msGMLOutput-doorverwijzingen over
+            if s.lstrip().startswith("<?xml") or "msGMLOutput" in s:
+                continue
             # Geef voorkeur aan waarden met een letter (klassieke GMM-code: cijfer-letter-cijfer)
             if re.search(r"[A-Za-z]", s):
                 return s
@@ -438,11 +444,24 @@ def gmm_from_wms(lat: float, lon: float) -> Tuple[Optional[str], dict]:
         kv = _parse_kv_text(props.get("_text", "")) or {}
         val = _first_code(kv)
         if val is None:
+            # Laatste redmiddel: probeer een code-achtige combinatie uit de tekst te vissen
             m = re.search(r"([0-9]+[A-Za-z][0-9]+)", str(props.get("_text", "")))
             if m:
-                val = m.group(1)
+                cand = m.group(1).strip()
+                # Filter ook hier "Nee" / lege / XML-achtige waarden weg
+                if cand and cand.lower() != "nee" and not cand.lstrip().startswith("<?xml") and "msGMLOutput" not in cand:
+                    val = cand
 
-    return val, props
+    if not val:
+        return None, props
+
+    sval = str(val).strip()
+    if not sval or sval.lower() == "nee":
+        return None, props
+    if sval.lstrip().startswith("<?xml") or "msGMLOutput" in sval:
+        return None, props
+
+    return sval, props
 
 # ───────────────────── PDOK value → vochtklasse
 GT_ORDINAL_TO_CODE = {
