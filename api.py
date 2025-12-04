@@ -17,6 +17,7 @@ import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 import tempfile  # ← toevoegen
+import json
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -30,6 +31,12 @@ from pyproj import Transformer
 # ───────────────────── PDOK endpoints
 HEADERS = {"User-Agent": "plantwijs/3.9.7"}
 FMT_JSON = "application/json;subtype=geojson"
+
+NSN_GEOJSON_PATH = os.path.join(os.path.dirname(__file__), "data", "nsn_natuurlijk_systeem.geojson")
+_NSN_CACHE: Optional[dict] = None
+NSN_GEOJSON_IS_RD: bool = True  # GeoJSON in RD New (EPSG:28992); op False zetten als je zelf naar WGS84 hebt geprojecteerd
+_NSN_FEATURES: Optional[list] = None
+_NSN_IS_RD: Optional[bool] = None
 
 # WFS FGR
 PDOK_FGR_WFS = (
@@ -653,6 +660,15 @@ def _match_bodem_row(row: pd.Series, keuzes: List[str]) -> bool:
 app = FastAPI(title="PlantWijs API v3.9.7")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET","POST"], allow_headers=["*"])
 
+@app.on_event("startup")
+def _startup_warm_nsn():
+    """Laad NSN-GeoJSON alvast in zodat de eerste klik sneller reageert."""
+    try:
+        _load_nsn_geojson()
+    except Exception as e:
+        print("[NSN] fout bij startup-warmup:", e)
+
+
 def _clean(o: Any) -> Any:
     if isinstance(o, float):
         return o if math.isfinite(o) else None
@@ -671,6 +687,138 @@ def _clean(o: Any) -> Any:
 @app.get("/api/wms_meta")
 def api_wms_meta():
     return JSONResponse(_clean(_WMSMETA))
+
+@app.get("/api/nsn")
+def api_nsn():
+    """
+    Retourneer GeoJSON voor Natuurlijk Systeem Nederland (NSN) als vectorlaag.
+    Verwacht een bestand "data/nsn_natuurlijk_systeem.geojson" naast deze api.py.
+    """
+    global _NSN_CACHE
+    if _NSN_CACHE is None:
+        try:
+            with open(NSN_GEOJSON_PATH, "r", encoding="utf-8") as f:
+                _NSN_CACHE = json.load(f)
+        except FileNotFoundError:
+            return JSONResponse({"error": "nsn_geojson_not_found"}, status_code=404)
+    return JSONResponse(_clean(_NSN_CACHE))
+
+
+def _load_nsn_geojson() -> Optional[dict]:
+    """
+    Laad het NSN-GeoJSON één keer en prepareer de features.
+    """
+    global _NSN_CACHE, _NSN_FEATURES, _NSN_IS_RD
+    if _NSN_CACHE is None:
+        try:
+            with open(NSN_GEOJSON_PATH, "r", encoding="utf-8") as f:
+                _NSN_CACHE = json.load(f)
+        except FileNotFoundError:
+            print("[NSN] GeoJSON bestand niet gevonden:", NSN_GEOJSON_PATH)
+            return None
+        except Exception as e:
+            print("[NSN] fout bij laden GeoJSON:", e)
+            return None
+    if _NSN_FEATURES is None:
+        feats = (_NSN_CACHE or {}).get("features") or []
+        _NSN_FEATURES = feats
+        _NSN_IS_RD = bool(NSN_GEOJSON_IS_RD)
+    return _NSN_CACHE
+
+
+def _point_in_polygon(px: float, py: float, ring) -> bool:
+    """
+    Standaard ray‑casting point‑in‑polygon test op basis van de buitenring.
+    """
+    inside = False
+    n = len(ring)
+    if n < 3:
+        return False
+    for i in range(n):
+        x1, y1 = ring[i]
+        x2, y2 = ring[(i + 1) % n]
+        # Kijk of de horizontale lijn door het segment gaat
+        if ((y1 > py) != (y2 > py)):
+            x_intersect = (x2 - x1) * (py - y1) / (y2 - y1 + 1e-9) + x1
+            if px < x_intersect:
+                inside = not inside
+    return inside
+
+
+def nsn_from_point(lat: float, lon: float) -> Optional[str]:
+    """
+    Bepaal het Natuurlijk Systeem Nederland (NSN)-vak op basis van een klikpunt.
+    Retourneert bij succes een beschrijving/naam; anders None.
+    """
+    if _load_nsn_geojson() is None:
+        return None
+    if not _NSN_FEATURES:
+        return None
+
+    # Transformeer klikpunt naar zelfde CRS als de GeoJSON
+    if _NSN_IS_RD:
+        px, py = TX_WGS84_RD.transform(lon, lat)
+    else:
+        px, py = lon, lat
+
+    def _label_from_props(props: dict) -> Optional[str]:
+        if not props:
+            return None
+        # Voorkeursvelden gebaseerd op BKNSN_2023: Subtype_na = beschrijving, BKNSN_code = code
+        for key in (
+            "Subtype_na", "SUBTYPE_NA",
+            "nsn_naam", "NSN_NAAM",
+            "natuurlijk_systeem", "NATUURLIJK_SYSTEEM",
+            "naam", "NAAM",
+        ):
+            if key in props and props[key]:
+                s = str(props[key]).strip()
+                if s:
+                    return s
+        # Val terug op BKNSN_code als code‑label
+        for key in ("BKNSN_code", "BKNSN_CODE"):
+            if key in props and props[key]:
+                s = str(props[key]).strip()
+                if s:
+                    return s
+        # Als laatste redmiddel: eerste niet‑lege stringwaarde
+        for v in props.values():
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return None
+
+    label: Optional[str] = None
+
+    for ft in _NSN_FEATURES:
+        g = (ft or {}).get("geometry") or {}
+        t = g.get("type")
+        coords = g.get("coordinates") or []
+        if not coords:
+            continue
+
+        def _test_polygon(poly_coords) -> Optional[str]:
+            if not poly_coords:
+                return None
+            ring = poly_coords[0]
+            try:
+                if _point_in_polygon(px, py, ring):
+                    props = (ft or {}).get("properties") or {}
+                    return _label_from_props(props)
+            except Exception as e:
+                print("[NSN] fout bij point‑in‑polygon:", e)
+            return None
+
+        if t == "Polygon":
+            label = _test_polygon(coords)
+        elif t == "MultiPolygon":
+            for poly in coords:
+                label = _test_polygon(poly)
+                if label:
+                    break
+        if label:
+            break
+
+    return label
 
 @app.get("/api/diag/featureinfo")
 def api_diag(service: str = Query(..., pattern="^(bodem|gt|ghg|glg|fgr)$"), lat: float = Query(...), lon: float = Query(...)):
@@ -823,6 +971,7 @@ def advies_geo(
 ):
     t0 = time.time()
     fgr = fgr_from_point(lat, lon) or "Onbekend"
+    nsn_val = nsn_from_point(lat, lon)
     bodem_raw, _props_bodem = bodem_from_bodemkaart(lat, lon)
     vocht_raw, _props_gwt, gt_code = vocht_from_gwt(lat, lon)
     ahn_val, _props_ahn = ahn_from_wms(lat, lon)
@@ -871,6 +1020,7 @@ def advies_geo(
         "ahn_bron": "PDOK AHN WMS (DTM 0.5m)" if ahn_val else "onbekend",
         "gmm": gmm_val,
         "gmm_bron": "BRO Geomorfologische kaart (GMM) WMS" if gmm_val else "onbekend",
+        "nsn": nsn_val,
         "advies": items,
         "elapsed_ms": int((time.time()-t0)*1000),
     }
@@ -901,6 +1051,7 @@ def index() -> HTMLResponse:
   grid-auto-rows:auto;
   gap:12px;
   padding:12px;
+  position:relative;
   /* geen geforceerde vaste hoogte op mobiel; laat de pagina scrollen */
   min-height:calc(100vh - 56px);
 }
@@ -932,6 +1083,21 @@ def index() -> HTMLResponse:
   }
   #map { height:100%; }
   .panel-right { height:100%; overflow:auto; }
+  .col-splitter {
+    position:absolute;
+    top:12px;
+    bottom:12px;
+    width:6px;
+    margin-left:-3px;
+    background:rgba(255,255,255,.2);
+    border-radius:999px;
+    cursor:col-resize;
+    z-index:500;
+  }
+  body.is-resizing {
+    cursor:col-resize;
+    user-select:none;
+  }
 }
 
 /* Extra: op hele brede schermen map iets breder dan paneel */
@@ -946,7 +1112,12 @@ def index() -> HTMLResponse:
     .pw-locate-btn { width:36px; height:36px; border-radius:999px; border:1px solid #1f2c49; background:#0c1730; color:#e6edf3; display:flex; align-items:center; justify-content:center; cursor:pointer; box-shadow:0 2px 6px rgba(0,0,0,.35); }
     .pw-locate-btn:hover { background:#13264a; }
 
-    .pw-ctl { background:var(--panel); color:var(--fg); border:1px solid var(--border); border-radius:12px; padding:10px; box-shadow:0 2px 12px rgba(0,0,0,.35); width:260px; }
+    .legend-inline, #clickInfo {
+      width:auto;
+      max-width:460px;
+      min-width:260px;
+    }
+.pw-ctl { background:var(--panel); color:var(--fg); border:1px solid var(--border); border-radius:12px; padding:10px; box-shadow:0 2px 12px rgba(0,0,0,.35); width:auto; min-width:260px; max-width:460px; }
     .pw-ctl h3 { margin:0 0 6px; font-size:14px; }
     .pw-ctl .sec { margin-top:8px; }
 
@@ -989,7 +1160,14 @@ def index() -> HTMLResponse:
     .toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:8px 0 10px; }
     .actions { display:flex; gap:8px; flex-wrap:wrap; }
     .btn { background:#0c1730; border:1px solid #1f2c49; color:var(--fg); padding:6px 10px; border-radius:8px; cursor:pointer; }
-    .btn:hover { background:#13264a; }
+    .tag-inheems {
+      display:inline-block;
+      margin-right:4px;
+      font-size:11px;
+      line-height:1;
+      color:#38d39f;
+    }
+.btn:hover { background:#13264a; }
     .btn-ghost { background:transparent; color:var(--fg); border:1px solid var(--border); padding:6px 10px; border-radius:8px; cursor:pointer; }
     .btn-ghost:hover { background:rgba(255,255,255,.06); }
 
@@ -1058,6 +1236,12 @@ body.light .leaflet-bar a:hover { background: #eaeef3 !important; } /* light hov
 }
 .leaflet-control-layers-overlays label {
   display: flex; gap: 8px; align-items: center;
+}
+.leaflet-control-layers-overlays label span {
+  flex:1 1 auto;
+}
+.leaflet-control-layers-overlays label .opacity-slider {
+  width:80px;
 }
 .leaflet-control-layers input.leaflet-control-layers-selector {
   accent-color: #5aa9ff; /* match je overige checkboxes */
@@ -1131,6 +1315,7 @@ body.light .leaflet-control-layers {
 
  <div class="wrap">
   <div id="map"></div>
+  <div id="colSplitter" class="col-splitter" aria-hidden="true"></div>
 
   <!-- Mobiele legenda (staat buiten/onder de kaart); desktop: verborgen -->
   <div id="legendInline" class="panel legend-inline" aria-live="polite">
@@ -1140,6 +1325,7 @@ body.light .leaflet-control-layers {
     <div id="uiG2" class="muted">Gt: —</div>
     <div id="uiH2" class="muted">AHN (m): —</div>
     <div id="uiM2" class="muted">Geomorfologie (GMM): —</div>
+    <div id="uiN2" class="muted">Natuurlijk Systeem (NSN): —</div>
   </div>
 
     <div class="panel panel-right">
@@ -1448,6 +1634,7 @@ setTimeout(fixMapSize, 0);
             <div id="uiG" class="muted">Gt: —</div>
             <div id="uiH" class="muted">AHN (m): —</div>
             <div id="uiM" class="muted">Geomorfologie (GMM): —</div>
+            <div id="uiN" class="muted">Natuurlijk Systeem (NSN): —</div>
           </div>
         `;
         L.DomEvent.disableClickPropagation(div);
@@ -1456,12 +1643,13 @@ setTimeout(fixMapSize, 0);
     });
     const infoCtl = new InfoCtl({ position: IS_MOBILE ? 'bottomright' : 'topright' }).addTo(map);
 
-  function setClickInfo({fgr, bodem, bodem_bron, gt, vocht, ahn, gmm}) {
+  function setClickInfo({fgr, bodem, bodem_bron, gt, vocht, ahn, gmm, nsn}) {
   const tF = "Fysisch Geografische Regio's: " + (fgr || '—');
   const tB = 'Bodem: ' + ((bodem || '—') + (bodem_bron ? ` (${bodem_bron})` : ''));
   const tG = 'Gt: ' + (gt || '—') + (vocht ? ` → ${vocht}` : ' (onbekend)');
   const tH = 'AHN (m): ' + ((ahn !== null && ahn !== undefined && ahn !== '') ? ahn : '—');
   const tM = 'Geomorfologie (GMM): ' + ((gmm !== null && gmm !== undefined && gmm !== '') ? gmm : '—');
+  const tN = 'Natuurlijk Systeem (NSN): ' + ((nsn !== null && nsn !== undefined && nsn !== '') ? nsn : '—');
 
   const set = (id, txt) => {
     const el = document.getElementById(id);
@@ -1474,6 +1662,7 @@ setTimeout(fixMapSize, 0);
   set('uiG', tG);
   set('uiH', tH);
   set('uiM', tM);
+  set('uiN', tN);
 
   // mobiele legenda onder de kaart
   set('uiF2', tF);
@@ -1481,18 +1670,107 @@ setTimeout(fixMapSize, 0);
   set('uiG2', tG);
   set('uiH2', tH);
   set('uiM2', tM);
+  set('uiN2', tN);
 }
 
-    async function loadWms(){
-      ui.meta = await (await fetch('/api/wms_meta')).json();
-      const make = (m, opacity)=> L.tileLayer.wms(m.url, { layers: m.layer, format:'image/png', transparent: true, opacity: opacity, version:'1.3.0', crs: L.CRS.EPSG3857 });
-      overlays['BRO Bodemkaart (Bodemvlakken)'] = make(ui.meta.bodem, 0.55).addTo(map);
-      overlays['BRO Grondwatertrappen (Gt)']    = make(ui.meta.gt,    0.45).addTo(map);
-      overlays["Fysisch Geografische Regio's"]  = make(ui.meta.fgr,   0.45).addTo(map);
-      overlays['AHN (hoogte, DTM 0.5m)']        = make(ui.meta.ahn,   0.50).addTo(map);
-      overlays['BRO Geomorfologische kaart (GMM)'] = make(ui.meta.gmm,   0.45).addTo(map);
+    function initSplitter(){
+      if (window.matchMedia('(max-width: 900px)').matches) return;
+      const wrap = document.querySelector('.wrap');
+      const handle = document.getElementById('colSplitter');
+      if (!wrap || !handle) return;
 
+      let dragging = false;
+
+      const applyFromX = (clientX)=>{
+        const rect = wrap.getBoundingClientRect();
+        let x = clientX - rect.left;
+        const min = rect.width * 0.25;
+        const max = rect.width * 0.75;
+        if (x < min) x = min;
+        if (x > max) x = max;
+        const pctLeft = (x / rect.width) * 100;
+        wrap.style.gridTemplateColumns = pctLeft.toFixed(1) + '% ' + (100 - pctLeft).toFixed(1) + '%';
+        handle.style.left = x + 'px';
+        if (typeof map !== 'undefined' && map && typeof map.invalidateSize === 'function') {
+          map.invalidateSize({animate:false});
+        }
+      };
+
+      // startpositie iets meer ruimte voor de kaart
+      const rect0 = document.querySelector('.wrap').getBoundingClientRect();
+      const startX = rect0.width * 0.55;
+      wrap.style.gridTemplateColumns = '55% 45%';
+      handle.style.left = startX + 'px';
+      if (typeof map !== 'undefined' && map && typeof map.invalidateSize === 'function') {
+        map.invalidateSize({animate:false});
+      }
+
+      handle.addEventListener('mousedown', (e)=>{
+        dragging = true;
+        document.body.classList.add('is-resizing');
+        e.preventDefault();
+      });
+
+      window.addEventListener('mouseup', ()=>{
+        if (!dragging) return;
+        dragging = false;
+        document.body.classList.remove('is-resizing');
+      });
+
+      window.addEventListener('mousemove', (e)=>{
+        if (!dragging) return;
+        applyFromX(e.clientX);
+      });
+    }
+
+async function loadWms(){
+      ui.meta = await (await fetch('/api/wms_meta')).json();
+      const make = (m, opacity)=> L.tileLayer.wms(m.url, { layers:m.layer, transparent:true, opacity: opacity, version:'1.3.0', crs: L.CRS.EPSG3857 });
+      overlays['BRO Bodemkaart (Bodemvlakken)'] = make(ui.meta.bodem, 0.6);
+      overlays['BRO Grondwatertrappen (Gt)']    = make(ui.meta.gt,    0.6);
+      overlays["Fysisch Geografische Regio's"]  = make(ui.meta.fgr,   0.6).addTo(map);
+      overlays['AHN (hoogte, DTM 0.5m)']        = make(ui.meta.ahn,   0.6);
+      overlays['BRO Geomorfologische kaart (GMM)'] = make(ui.meta.gmm,   0.6);
 const ctlLayers = L.control.layers({}, overlays, { collapsed:true, position:'bottomleft' }).addTo(map);
+
+      function attachOpacityControls() {
+        const cont = ctlLayers.getContainer();
+        if (!cont) return;
+        const labels = cont.querySelectorAll('.leaflet-control-layers-overlays label');
+        labels.forEach(label => {
+          const span = label.querySelector('span');
+          if (!span) return;
+          const name = span.textContent.trim();
+          const layer = overlays[name];
+          if (!layer || typeof layer.setOpacity !== 'function') return;
+          if (label.querySelector('.opacity-slider')) return; // voorkom dubbele sliders
+
+          const slider = document.createElement('input');
+          slider.type = 'range';
+          slider.className = 'opacity-slider';
+          slider.min = '0';
+          slider.max = '1';
+          slider.step = '0.1';
+          const startOpacity = (layer.options && typeof layer.options.opacity === 'number') ? layer.options.opacity : 0.6;
+          slider.value = String(startOpacity);
+          slider.style.marginLeft = '0.5em';
+          slider.style.verticalAlign = 'middle';
+          slider.title = 'Doorzichtigheid laag';
+
+          slider.addEventListener('input', () => {
+            const v = parseFloat(slider.value);
+            if (!isNaN(v) && layer.setOpacity) {
+              layer.setOpacity(v);
+            }
+          });
+
+          label.appendChild(slider);
+        });
+      }
+
+      attachOpacityControls();
+
+
 
 
 
@@ -1649,6 +1927,12 @@ const ctlLayers = L.control.layers({}, overlays, { collapsed:true, position:'bot
         const tds = vis.map(k=>{
           let v = r[k];
           if(k==='bodem' && !v) v = r['grondsoorten'] || '';
+          if(k==='naam'){
+            const base = html(v||'');
+            const isNative = String(r['inheems']||'').trim().toLowerCase() === 'ja';
+            const leaf = isNative ? '<span class="tag-inheems" title="inheems">🍃</span> ' : '';
+            return `<td>${leaf}${base}</td>`;
+          }
           return `<td>${html(v||'')}</td>`;
         }).join('');
         return `<tr>${tds}</tr>`;
@@ -1719,6 +2003,9 @@ const ctlLayers = L.control.layers({}, overlays, { collapsed:true, position:'bot
       if(window._marker) window._marker.remove();
       window._marker = L.marker(e.latlng).addTo(map);
 
+      // toon direct een korte melding zodat het duidelijk is dat er geladen wordt
+      setClickInfo({ fgr:'(laden...)', bodem:null, bodem_bron:null, gt:null, vocht:null, ahn:null, gmm:null, nsn:null });
+
       const urlCtx = new URL(location.origin + '/advies/geo');
       urlCtx.searchParams.set('lat', e.latlng.lat);
       urlCtx.searchParams.set('lon', e.latlng.lng);
@@ -1727,14 +2014,20 @@ const ctlLayers = L.control.layers({}, overlays, { collapsed:true, position:'bot
       if(inh) urlCtx.searchParams.set('inheems_only', !!inh.checked);
       if(inv) urlCtx.searchParams.set('exclude_invasief', !!inv.checked);
 
-      const j = await (await fetch(urlCtx)).json();
+      try{
+        const resp = await fetch(urlCtx);
+        const j = await resp.json();
 
-      setClickInfo({ fgr:j.fgr, bodem:j.bodem, bodem_bron:j.bodem_bron, gt:j.gt_code, vocht:j.vocht, ahn:j.ahn, gmm:j.gmm });
+        setClickInfo({ fgr:j.fgr, bodem:j.bodem, bodem_bron:j.bodem_bron, gt:j.gt_code, vocht:j.vocht, ahn:j.ahn, gmm:j.gmm, nsn:j.nsn });
 
-      // bewaar context (gebruikt door refresh / filters)
-      ui.ctx = { vocht: j.vocht || null, bodem: j.bodem || null };
+        // bewaar context (gebruikt door refresh / filters)
+        ui.ctx = { vocht: j.vocht || null, bodem: j.bodem || null };
 
-      refresh();
+        refresh();
+      } catch(err){
+        console?.error && console.error('Fout bij ophalen advies/geo', err);
+        setClickInfo({ fgr:'(kon gegevens niet laden)', bodem:null, bodem_bron:null, gt:null, vocht:null, ahn:null, gmm:null, nsn:null });
+      }
     });
 
     // Bouw de kolomkoppen; de titels zelf zijn de filter-triggers
@@ -1798,7 +2091,7 @@ const ctlLayers = L.control.layers({}, overlays, { collapsed:true, position:'bot
       openColsMenu(e.currentTarget);
     });
 
-    loadWms().then(refresh);
+    loadWms().then(()=>{ refresh(); initSplitter(); });
   </script>
 </body>
 </html>
