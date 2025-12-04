@@ -416,33 +416,69 @@ def ahn_from_wms(lat: float, lon: float) -> Tuple[Optional[str], dict]:
 def gmm_from_wms(lat: float, lon: float) -> Tuple[Optional[str], dict]:
     """
     Haal een geomorfologische eenheid op via de BRO Geomorfologische kaart (GMM) WMS.
-    Retourneert (code_of_omschrijving, raw_props).
+    Retourneert (omschrijving, raw_props), waarbij de omschrijving afkomstig is uit de
+    landvormsubgroep-beschrijving (indien beschikbaar).
     """
     layer = _WMSMETA.get("gmm", {}).get("layer") or "geomorphological_area"
     props = _wms_getfeatureinfo(GMM_WMS, layer, lat, lon) or {}
 
-    def _first_code(d: dict) -> Optional[str]:
-        for k, v in d.items():
-            s = str(v).strip()
-            if not s:
-                continue
-            # Geef voorkeur aan waarden met een letter (klassieke GMM-code: cijfer-letter-cijfer)
-            if re.search(r"[A-Za-z]", s):
-                return s
+    def _norm_key(k: str) -> str:
+        return k.lower().replace("_", "").replace("-", "")
+
+    def _first_from_keys(d: dict, candidates) -> Optional[str]:
+        if not d:
+            return None
+        # maak een lookup van genormaliseerde sleutel → originele sleutel
+        kl = { _norm_key(k): k for k in d.keys() }
+        for wanted in candidates:
+            want_norm = wanted.lower().replace("_", "").replace("-", "")
+            for nk, orig in kl.items():
+                if want_norm == nk or want_norm in nk:
+                    v = d.get(orig)
+                    if v is None:
+                        continue
+                    s = str(v).strip()
+                    if not s:
+                        continue
+                    sl = s.lower()
+                    # filter expliciete nietszeggende waarden
+                    if sl == "nee":
+                        continue
+                    if s.lstrip().startswith("<?xml") or "msGMLOutput" in s:
+                        continue
+                    if sl.startswith("geom50000"):
+                        continue
+                    return s
         return None
+
+    # Voorkeursvelden volgens BRO-catalogus:
+    #   landvormsubgroep_beschrijving / landformsubgroup_description
+    # Eventueel uitbreidbaar met andere beschrijvingsvelden indien nodig.
+    desc_keys = [
+        "landformsubgroup_description",
+        "landvormsubgroep_beschrijving",
+    ]
 
     val: Optional[str] = None
     if props:
-        val = _first_code(props)
+        val = _first_from_keys(props, desc_keys)
+
+    # Als het in _text staat als key/value, probeer dat ook
     if val is None and "_text" in props:
         kv = _parse_kv_text(props.get("_text", "")) or {}
-        val = _first_code(kv)
-        if val is None:
-            m = re.search(r"([0-9]+[A-Za-z][0-9]+)", str(props.get("_text", "")))
-            if m:
-                val = m.group(1)
+        val = _first_from_keys(kv, desc_keys)
 
-    return val, props
+    if not val:
+        return None, props
+
+    sval = str(val).strip()
+    sl = sval.lower()
+    if not sval or sl == "nee":
+        return None, props
+    if sval.lstrip().startswith("<?xml") or "msGMLOutput" in sval or sl.startswith("geom50000"):
+        return None, props
+
+    return sval, props
 
 # ───────────────────── PDOK value → vochtklasse
 GT_ORDINAL_TO_CODE = {
