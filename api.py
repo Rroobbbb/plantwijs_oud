@@ -44,6 +44,9 @@ BODEM_WMS = "https://service.pdok.nl/bzk/bro-bodemkaart/wms/v1_0"
 # WMS Grondwaterspiegeldiepte (BRO)
 GWD_WMS = "https://service.pdok.nl/bzk/bro-grondwaterspiegeldiepte/wms/v2_0"
 
+# AHN WMS (Actueel Hoogtebestand Nederland, DTM 0.5m)
+AHN_WMS = "https://service.pdok.nl/rws/ahn/wms/v1_0"
+
 # ───────────────────── Proj
 TX_WGS84_RD = Transformer.from_crs(4326, 28992, always_xy=True)
 TX_WGS84_WEB = Transformer.from_crs(4326, 3857, always_xy=True)
@@ -220,11 +223,13 @@ def _resolve_layers() -> None:
     gt = _find_layer_name(GWD_WMS, ["grondwatertrappen", "gt"]) or ("BRO Grondwaterspiegeldiepte Grondwatertrappen Gt", "Gt")
     ghg = _find_layer_name(GWD_WMS, ["ghg"]) or ("BRO Grondwaterspiegeldiepte GHG", "GHG")
     glg = _find_layer_name(GWD_WMS, ["glg"]) or ("BRO Grondwaterspiegeldiepte GLG", "GLG")
+    ahn = _find_layer_name(AHN_WMS, ["dtm_05m", "dtm", "ahn"]) or ("dtm_05m", "AHN hoogte (DTM 0.5m)")
     meta["fgr"] = {"url": FGR_WMS, "layer": fgr[0], "title": fgr[1]}
     meta["bodem"] = {"url": BODEM_WMS, "layer": bodem[0], "title": bodem[1]}
     meta["gt"] = {"url": GWD_WMS, "layer": gt[0], "title": gt[1]}
     meta["ghg"] = {"url": GWD_WMS, "layer": ghg[0], "title": ghg[1]}
     meta["glg"] = {"url": GWD_WMS, "layer": glg[0], "title": glg[1]}
+    meta["ahn"] = {"url": AHN_WMS, "layer": ahn[0], "title": ahn[1]}
     _WMSMETA = meta
     print("[WMS] resolved:", meta)
 
@@ -363,6 +368,44 @@ def bodem_from_bodemkaart(lat: float, lon: float) -> Tuple[Optional[str], dict]:
         return so, props
 
     return None, props
+
+
+def ahn_from_wms(lat: float, lon: float) -> Tuple[Optional[str], dict]:
+    """
+    Haal een AHN-hoogte (DTM) op via de PDOK AHN WMS.
+    Retourneert (hoogte_meter, raw_props) waarbij hoogte_meter als string is geformatteerd.
+    """
+    layer = _WMSMETA.get("ahn", {}).get("layer") or "dtm_05m"
+    props = _wms_getfeatureinfo(AHN_WMS, layer, lat, lon) or {}
+
+    def _first_numeric_value(d: dict) -> Optional[float]:
+        for v in d.values():
+            s = str(v).strip()
+            if re.fullmatch(r"-?\d+(\.\d+)?", s):
+                try:
+                    return float(s)
+                except Exception:
+                    continue
+        return None
+
+    val: Optional[float] = None
+    if props:
+        val = _first_numeric_value(props)
+    if val is None and "_text" in props:
+        kv = _parse_kv_text(props.get("_text", "")) or {}
+        val = _first_numeric_value(kv)
+        if val is None:
+            m = re.search(r"(-?\d+(?:\.\d+)?)", str(props.get("_text", "")))
+            if m:
+                try:
+                    val = float(m.group(1))
+                except Exception:
+                    val = None
+
+    if val is None:
+        return None, props
+    # Format met 2 decimalen; UI toont dit rechtstreeks
+    return f"{val:.2f}", props
 
 # ───────────────────── PDOK value → vochtklasse
 GT_ORDINAL_TO_CODE = {
@@ -709,6 +752,7 @@ def advies_geo(
     fgr = fgr_from_point(lat, lon) or "Onbekend"
     bodem_raw, _props_bodem = bodem_from_bodemkaart(lat, lon)
     vocht_raw, _props_gwt, gt_code = vocht_from_gwt(lat, lon)
+    ahn_val, _props_ahn = ahn_from_wms(lat, lon)
 
     bodem_val = bodem_raw
     vocht_val = vocht_raw
@@ -749,6 +793,8 @@ def advies_geo(
         "gt_code": gt_code,
         "vocht": vocht_raw,
         "vocht_bron": "BRO Gt/GLG WMS" if vocht_raw else "onbekend",
+        "ahn": ahn_val,
+        "ahn_bron": "PDOK AHN WMS (DTM 0.5m)" if ahn_val else "onbekend",
         "advies": items,
         "elapsed_ms": int((time.time()-t0)*1000),
     }
@@ -1016,6 +1062,7 @@ body.light .leaflet-control-layers {
     <div id="uiF2" class="muted">Fysisch Geografische Regio's: —</div>
     <div id="uiB2" class="muted">Bodem: —</div>
     <div id="uiG2" class="muted">Gt: —</div>
+    <div id="uiH2" class="muted">AHN (m): —</div>
   </div>
 
     <div class="panel panel-right">
@@ -1322,6 +1369,7 @@ setTimeout(fixMapSize, 0);
             <div id="uiF" class="muted">Fysisch Geografische Regio's: —</div>
             <div id="uiB" class="muted">Bodem: —</div>
             <div id="uiG" class="muted">Gt: —</div>
+            <div id="uiH" class="muted">AHN (m): —</div>
           </div>
         `;
         L.DomEvent.disableClickPropagation(div);
@@ -1330,10 +1378,11 @@ setTimeout(fixMapSize, 0);
     });
     const infoCtl = new InfoCtl({ position: IS_MOBILE ? 'bottomright' : 'topright' }).addTo(map);
 
-  function setClickInfo({fgr, bodem, bodem_bron, gt, vocht}) {
+  function setClickInfo({fgr, bodem, bodem_bron, gt, vocht, ahn}) {
   const tF = "Fysisch Geografische Regio's: " + (fgr || '—');
   const tB = 'Bodem: ' + ((bodem || '—') + (bodem_bron ? ` (${bodem_bron})` : ''));
   const tG = 'Gt: ' + (gt || '—') + (vocht ? ` → ${vocht}` : ' (onbekend)');
+  const tH = 'AHN (m): ' + ((ahn !== null && ahn !== undefined && ahn !== '') ? ahn : '—');
 
   const set = (id, txt) => {
     const el = document.getElementById(id);
@@ -1344,11 +1393,13 @@ setTimeout(fixMapSize, 0);
   set('uiF', tF);
   set('uiB', tB);
   set('uiG', tG);
+  set('uiH', tH);
 
   // mobiele legenda onder de kaart
   set('uiF2', tF);
   set('uiB2', tB);
   set('uiG2', tG);
+  set('uiH2', tH);
 }
 
     async function loadWms(){
@@ -1357,6 +1408,7 @@ setTimeout(fixMapSize, 0);
       overlays['BRO Bodemkaart (Bodemvlakken)'] = make(ui.meta.bodem, 0.55).addTo(map);
       overlays['BRO Grondwatertrappen (Gt)']    = make(ui.meta.gt,    0.45).addTo(map);
       overlays["Fysisch Geografische Regio's"]  = make(ui.meta.fgr,   0.45).addTo(map);
+      overlays['AHN (hoogte, DTM 0.5m)']        = make(ui.meta.ahn,   0.50).addTo(map);
 
 const ctlLayers = L.control.layers({}, overlays, { collapsed:true, position:'bottomleft' }).addTo(map);
 
@@ -1595,7 +1647,7 @@ const ctlLayers = L.control.layers({}, overlays, { collapsed:true, position:'bot
 
       const j = await (await fetch(urlCtx)).json();
 
-      setClickInfo({ fgr:j.fgr, bodem:j.bodem, bodem_bron:j.bodem_bron, gt:j.gt_code, vocht:j.vocht });
+      setClickInfo({ fgr:j.fgr, bodem:j.bodem, bodem_bron:j.bodem_bron, gt:j.gt_code, vocht:j.vocht, ahn:j.ahn });
 
       // bewaar context (gebruikt door refresh / filters)
       ui.ctx = { vocht: j.vocht || null, bodem: j.bodem || null };
